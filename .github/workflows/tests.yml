@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install dependencies
-        run: microdnf install --quiet --assumeyes sqlite-libs
-      - run: microdnf list --installed sqlite
+        run: microdnf install --quiet --assumeyes sqlite-devel
+      - run: microdnf list --installed | grep sqlite
       - run: inko --version
       - run: inko test

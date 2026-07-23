@@ -1,25 +1,107 @@
 # Low-level bindings to [SQLite](https://sqlite.org/index.html).
 #
+# This module provides a set of bindings to the SQLite C API. For more
+# information, refer to the documentation of the `Database` type.
+#
 # # Requirements
 #
 # The bindings provided by this module use the SQLite C API and require that a
 # SQLite shared or static library is available to link against. For example, on
-# Fedora you'll need to install the `sqlite-libs` package.
+# Fedora you'll need to install the `sqlite-devel` package.
+#
+# # Examples
+#
+# Creating a database connection and inserting some data:
+#
+# ```inko
+# import sqlite (Database)
+#
+# let db = Database.new(':memory:').or_panic
+#
+# let _ = db.execute('CREATE TABLE users (name TEXT)').or_panic
+# let _ = db.execute('INSERT INTO users VALUES ("Alice")').or_panic
+# ```
+#
+# Doing the same but by binding runtime values:
+#
+# ```inko
+# import sqlite (Database)
+#
+# let db = Database.new(':memory:').or_panic
+#
+# let _ = db.execute('CREATE TABLE users (name TEXT)').or_panic
+# let st = db.prepare('INSERT INTO users VALUES (?)').or_panic
+#
+# st.bind(column: 0, value: 'Alice').or_panic
+# st.execute.or_panic
+# ```
+#
+# Creating a `BLOB` value by incrementally writing data to it:
+#
+# ```inko
+# import sqlite (Database, MAIN_DB)
+#
+# let db = Database.new(':memory:').or_panic
+# let _ = db.execute('CREATE TABLE files (name TEXT, data BLOB)').or_panic
+# let st = db.prepare('INSERT INTO files VALUES (:name, :data)').or_panic
+# let val = 'This is an example'
+#
+# st.bind(':name', 'README.md').or_panic
+# st.bind_blob(':data', val.size).or_panic
+#
+# let _ = st.execute.or_panic
+# let id = db.last_inserted_row_id
+# let blob = db
+#   .blob(MAIN_DB, table: 'files', column: 'data', row: id, write: true)
+#   .or_panic
+#
+# blob.write(val).or_panic
+# ```
+#
+# For small blobs it's usually easier/less verbose to use `Statement.bind` with
+# a `ByteArray`, but for large blobs you'll want to use the incremental blob API
+# to avoid having to load entire blobs into memory.
 import extern "sqlite3"
 
-import std.cmp (Equal)
+import std.bytes (Bytes)
+import std.cmp (Equal, max, min)
+import std.drop (Drop)
 import std.fmt (Format, Formatter)
+import std.io (Error as IoError, Read, Seek, SeekFrom, Write)
+import std.iter (Iter)
 import std.ptr (null)
 import std.reflect (enum_tag)
 import std.string (ToString)
 
-let SQLITE_OK = 0
+let SQLITE_ABORT = 4
+let SQLITE_BUSY = 5
+let SQLITE_CANTOPEN = 14
+let SQLITE_CONSTRAINT = 19
+let SQLITE_CORRUPT = 11
 let SQLITE_DONE = 101
-let SQLITE_UTF8 = 1
-let SQLITE_TRANSIENT = -1
+let SQLITE_ERROR = 1
+let SQLITE_FULL = 13
+let SQLITE_IOERR = 10
+let SQLITE_MISMATCH = 20
+let SQLITE_NOMEM = 7
+let SQLITE_NOTADB = 26
+let SQLITE_OK = 0
+let SQLITE_OPEN_CREATE = 0x00000004
 let SQLITE_OPEN_READONLY = 0x00000001
 let SQLITE_OPEN_READWRITE = 0x00000002
-let SQLITE_OPEN_CREATE = 0x00000004
+let SQLITE_PROTOCOL = 15
+let SQLITE_RANGE = 25
+let SQLITE_READONLY = 8
+let SQLITE_ROW = 100
+let SQLITE_SCHEMA = 17
+let SQLITE_TOOBIG = 18
+let SQLITE_TRANSIENT = -1
+let SQLITE_UTF8 = 1
+
+let I32_MAX = 2 ** 31 - 1
+
+# The name of the main database.
+let pub MAIN_DB = 'main'
 
 fn extern sqlite3_open_v2(
   path: Pointer[Uint8],
@@ -36,6 +118,8 @@ fn extern sqlite3_prepare_v2(
   tail: Pointer[Uint8],
 ) -> Int32
 
+fn extern sqlite3_errcode(db: Pointer[Uint8]) -> Int32
+
 fn extern sqlite3_errstr(code: Int32) -> Pointer[Uint8]
 
 fn extern sqlite3_step(statement: Pointer[Uint8]) -> Int32
@@ -46,7 +130,14 @@ fn extern sqlite3_close(db: Pointer[Uint8]) -> Int32
 
 fn extern sqlite3_reset(statement: Pointer[Uint8]) -> Int32
 
-fn extern sqlite3_changes(db: Pointer[Uint8]) -> Int32
+fn extern sqlite3_clear_bindings(statement: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_changes64(db: Pointer[Uint8]) -> Int64
+
+fn extern sqlite3_bind_parameter_index(
+  statement: Pointer[Uint8],
+  name: Pointer[Uint8],
+) -> Int32
 
 fn extern sqlite3_bind_null(statement: Pointer[Uint8], column: Int32) -> Int32
 
@@ -66,31 +157,223 @@ fn extern sqlite3_bind_text64(
   statement: Pointer[Uint8],
   column: Int32,
   value: Pointer[Uint8],
-  size: Int,
+  size: Uint64,
   destructor: Pointer[Uint8],
-  encoding: Int8,
-) -> Int32
-
-fn extern sqlite3_bind_zeroblob(
-  statement: Pointer[Uint8],
-  column: Int32,
-  size: Int32,
+  encoding: Uint8,
 ) -> Int32
 
 fn extern sqlite3_bind_blob64(
   statement: Pointer[Uint8],
   column: Int32,
   value: Pointer[Uint8],
-  size: Int,
+  size: Uint64,
   destructor: Pointer[Uint8],
 ) -> Int32
 
-# An error produced when opening a database connection.
-type pub copy enum OpenError {
-  case Other(Int)
+fn extern sqlite3_bind_zeroblob64(
+  statement: Pointer[Uint8],
+  column: Int32,
+  size: Uint64,
+) -> Int32
+
+fn extern sqlite3_column_int64(statement: Pointer[Uint8], column: Int32) -> Int
+
+fn extern sqlite3_column_double(
+  statement: Pointer[Uint8],
+  column: Int32,
+) -> Float
+
+fn extern sqlite3_column_blob(
+  statement: Pointer[Uint8],
+  column: Int32,
+) -> Pointer[Uint8]
+
+fn extern sqlite3_column_bytes(
+  statement: Pointer[Uint8],
+  column: Int32,
+) -> Int32
+
+fn extern sqlite3_column_count(statement: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_stmt_busy(statement: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_last_insert_rowid(db: Pointer[Uint8]) -> Int
+
+fn extern sqlite3_blob_open(
+  db: Pointer[Uint8],
+  name: Pointer[Uint8],
+  table: Pointer[Uint8],
+  column: Pointer[Uint8],
+  row: Int,
+  flags: Int32,
+  result: Pointer[Uint8],
+) -> Int32
+
+fn extern sqlite3_blob_close(blob: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_blob_write(
+  blob: Pointer[Uint8],
+  buffer: Pointer[Uint8],
+  size: Int32,
+  offset: Int32,
+) -> Int32
+
+fn extern sqlite3_blob_read(
+  blob: Pointer[Uint8],
+  buffer: Pointer[Uint8],
+  size: Int32,
+  offset: Int32,
+) -> Int32
+
+fn extern sqlite3_blob_bytes(blob: Pointer[Uint8]) -> Int32
+
+# A column index or name to bind to a SQLite statement.
+trait pub BindIndex {
+  fn bind_sqlite_index(handle: Pointer[Uint8]) -> Int
 }
 
-impl Equal for OpenError {
+impl BindIndex for Int {
+  fn inline bind_sqlite_index(handle: Pointer[Uint8]) -> Int {
+    # In the SQLite API, bind columns start at index 1 instead of index 0.
+    self + 1
+  }
+}
+
+impl BindIndex for String {
+  fn inline bind_sqlite_index(handle: Pointer[Uint8]) -> Int {
+    sqlite3_bind_parameter_index(handle, pointer) as Int
+  }
+}
+
+# A value that may be bound to a column in a SQLite statement.
+trait pub BindValue {
+  fn bind_sqlite_value(handle: Pointer[Uint8], index: Int) -> Int
+}
+
+impl BindValue for Int {
+  fn bind_sqlite_value(handle: Pointer[Uint8], index: Int) -> Int {
+    sqlite3_bind_int64(handle, index as Int32, self) as Int
+  }
+}
+
+impl BindValue for Bool {
+  fn bind_sqlite_value(handle: Pointer[Uint8], index: Int) -> Int {
+    to_int.bind_sqlite_value(handle, index)
+  }
+}
+
+impl BindValue for Float {
+  fn bind_sqlite_value(handle: Pointer[Uint8], index: Int) -> Int {
+    sqlite3_bind_double(handle, index as Int32, self as Float64) as Int
+  }
+}
+
+impl BindValue for Nil {
+  fn bind_sqlite_value(handle: Pointer[Uint8], index: Int) -> Int {
+    sqlite3_bind_null(handle, index as Int32) as Int
+  }
+}
+
+impl BindValue for String {
+  fn bind_sqlite_value(handle: Pointer[Uint8], index: Int) -> Int {
+    let len = size as Uint64
+    let trans = SQLITE_TRANSIENT as Pointer[Uint8]
+    let enc = SQLITE_UTF8 as Uint8
+
+    sqlite3_bind_text64(handle, index as Int32, pointer, len, trans, enc) as Int
+  }
+}
+
+impl BindValue for ByteArray {
+  fn bind_sqlite_value(handle: Pointer[Uint8], index: Int) -> Int {
+    let trans = SQLITE_TRANSIENT as Pointer[Uint8]
+
+    sqlite3_bind_blob64(handle, index as Int32, pointer, size as Uint64, trans)
+      as Int
+  }
+}
+
+# An error produced by SQLite.
+#
+# For commonly encountered errors a dedicated constructor is provided (e.g.
+# `Error.Busy`). Some errors are merged into a single constructor, such as
+# `Error.InvalidFile` which is used for both `SQLITE_NOTADB` and
+# `SQLITE_CANTOPEN`. Other errors are represented using the `Error.Other`
+# constructor.
+type pub copy enum Error {
+  # An operation was aborted prior to completion.
+  case Aborted
+
+  # The database could not be written to or read from because of concurrent
+  # activity by another connection.
+  case Busy
+
+  # A database or temporary file couldn't be opened, or the database is corrupt.
+  #
+  # This may happen when creating a new database connection, or when a temporary
+  # file can't be opened as part of an existing connection.
+  case InvalidFile
+
+  # A SQL constraint violation occurred while running a SQL statement.
+  case Constraint
+
+  # A write could not be performed because the disk is full.
+  case Full
+
+  # A generic error produced while performing IO operations.
+  case Io
+
+  # The type of a value doesn't match the expected type.
+  case InvalidType
+
+  # The required amount of memory couldn't be allocated by SQLite.
+  case NoMemory
+
+  # SQLite failed to acquire the necessary locks in time.
+  case LockFailed
+
+  # A column number used (e.g. when binding values) is out of bounds.
+  case InvalidColumn
+
+  # The database is in read-only mode and an attempt to write data occurred.
+  case ReadOnly
+
+  # The database schemea changed between preparing and executing a statement.
+  case SchemaChanged
+
+  # A string, blob or SQL statement is too large.
+  case TooLarge
+
+  # A generic error produced by SQlite when no more specific error is available.
+  case Generic
+
+  # Any other error code produced by SQLite.
+  case Other(Int)
+
+  fn static new(value: Int) -> Self {
+    match value {
+      case SQLITE_ABORT -> Aborted
+      case SQLITE_BUSY -> Busy
+      case SQLITE_NOMEM -> NoMemory
+      case SQLITE_READONLY -> ReadOnly
+      case SQLITE_IOERR -> Io
+      case SQLITE_CORRUPT or SQLITE_CANTOPEN or SQLITE_MISMATCH or SQLITE_NOTADB
+      -> {
+        InvalidFile
+      }
+      case SQLITE_FULL -> Full
+      case SQLITE_PROTOCOL -> LockFailed
+      case SQLITE_SCHEMA -> SchemaChanged
+      case SQLITE_TOOBIG -> TooLarge
+      case SQLITE_CONSTRAINT -> Constraint
+      case SQLITE_RANGE -> InvalidColumn
+      case SQLITE_ERROR -> Generic
+      case v -> Other(v)
+    }
+  }
+}
+
+impl Equal for Error {
   fn pub ==(other: Self) -> Bool {
     match (self, other) {
       case (Other(a), Other(b)) -> a == b
@@ -99,64 +382,843 @@ impl Equal for OpenError {
   }
 }
 
-impl ToString for OpenError {
+impl ToString for Error {
   fn pub to_string -> String {
     match self {
+      case Aborted -> 'the operation was aborted'
+      case Busy -> 'the operation failed because the database is busy'
+      case InvalidFile -> {
+        "the database or a temporary file is invalid or couldn't be opened"
+      }
+      case Constraint -> 'a constraint violation occurred'
+      case Full -> 'the disk is full'
+      case Io -> 'an IO error occurred'
+      case InvalidType -> "the type of a value doesn't match the expected type"
+      case NoMemory -> 'SQLite failed to allocate the necessary memory'
+      case LockFailed -> 'SQLite failed to acquire the necessary locks in time'
+      case InvalidColumn -> 'the column number is out of bounds'
+      case ReadOnly -> 'the database is read-only'
+      case SchemaChanged -> {
+        'the database schemea changed between preparing and executing a statement'
+      }
+      case TooLarge -> 'a string, blob or SQL statement is too large'
+      case Generic -> 'a generic SQLite error occurred'
       case Other(v) -> String.from_pointer(sqlite3_errstr(v as Int32))
     }
   }
 }
 
-impl Format for OpenError {
+impl Format for Error {
   fn pub fmt(formatter: mut Formatter) {
     match self {
+      case Aborted -> formatter.tuple('Aborted').finish
+      case Busy -> formatter.tuple('Busy').finish
+      case InvalidFile -> formatter.tuple('InvalidFile').finish
+      case Constraint -> formatter.tuple('Constraint').finish
+      case Full -> formatter.tuple('Full').finish
+      case Io -> formatter.tuple('Io').finish
+      case InvalidType -> formatter.tuple('InvalidType').finish
+      case NoMemory -> formatter.tuple('NoMemory').finish
+      case LockFailed -> formatter.tuple('LockFailed').finish
+      case InvalidColumn -> formatter.tuple('InvalidColumn').finish
+      case ReadOnly -> formatter.tuple('ReadOnly').finish
+      case SchemaChanged -> formatter.tuple('SchemaChanged').finish
+      case TooLarge -> formatter.tuple('TooLarge').finish
+      case Generic -> formatter.tuple('Generic').finish
       case Other(v) -> formatter.tuple('Other').field(v).finish
     }
   }
 }
 
+# A SQLite database connection.
+#
+# Connections to a database are established using `Database.new` or
+# `Database.read_only`. To run a query, prepare a statement using
+# `Database.prepare` then execute it using `Statement.execute` or
+# `Statement.rows`. For queries that don't return rows (or you don't care about
+# them) you can also use `Database.execute`.
 type pub Database {
   let @handle: Pointer[Uint8]
 
   fn static open[T: ToString](
     path: ref T,
     flags: Int,
-  ) -> Result[Database, OpenError] {
+  ) -> Result[Database, Error] {
+    let path = path.to_string
     let handle = null
-    let code = sqlite3_open_v2(
-      path.to_string.pointer,
-      mut handle,
-      flags as Int32,
-      null,
-    )
-      as Int
+    let flags = flags as Int32
+    let db = match
+      sqlite3_open_v2(path.pointer, mut handle, flags, null) as Int
+    {
+      case SQLITE_OK -> Database(handle)
+      case v -> {
+        if handle as Int != (null as Int) { sqlite3_close(handle) }
 
-    if code == SQLITE_OK {
-      Result.Ok(Database(handle))
-    } else {
-      # TODO: sqlite docs don't mention which exact error codes may be returned
-      # when opening a database, but we should avoid returning a big error enum
-      # containing irrelevant constructors.
-
-      if handle as Int != (null as Int) { sqlite3_close(handle) }
-
-      Result.Error(OpenError.Other(code))
+        throw Error.new(v)
+      }
     }
+
+    try db.apply_reasonable_defaults
+    Result.Ok(db)
   }
 
-  fn pub static new[T: ToString](path: ref T) -> Result[Database, OpenError] {
+  # Opens a new database connection to the database located at `path`.
+  #
+  # If `path` is set to `:memory:` then an in-memory database is opened.
+  #
+  # The database is opened with read and write permissions, and is created if it
+  # doesn't exist.
+  #
+  # # Defaults
+  #
+  # The SQLite defaults are a little outdated and can cause problems for
+  # concurrent applications. To improve things, this method automatically
+  # applies a set of reasonable defaults based on the following articles:
+  #
+  # - <https://kerkour.com/sqlite-for-servers>
+  # - <https://mort.coffee/home/sqlite-editions/>
+  # - <https://fractaledmind.com/2023/09/07/enhancing-rails-sqlite-fine-tuning/>
+  #
+  # In particular, the following settings are applied:
+  #
+  # - WAL mode is enabeld
+  # - The busy timeout is set to 5 seconds
+  # - Synchronous mode is set to "NORMAL"
+  # - The cache size is set to 8 MiB instead of the default 2 MiB
+  # - Foreign key enforcement is enabled
+  # - Temporary tables are stored in memory
+  #
+  # # Errors
+  #
+  # Opening a database may fail for any number of reasons, such as insufficient
+  # file permissions. In addition, it's possible for a `Error.Busy` error to be
+  # produced when opening a database as mentioned in [this
+  # article](https://hynek.me/til/sqlite-read-only-wal-locked/).
+  #
+  # # Examples
+  #
+  # Opening an in-memory database:
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # Database.new(':memory:').or_panic
+  # ```
+  #
+  # Opening a database stored on disk:
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # Database.new('example.db').or_panic
+  # ```
+  fn pub static new[T: ToString](path: ref T) -> Result[Database, Error] {
     open(path, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
   }
 
-  fn pub static read_only[T: ToString](
-    path: ref T,
-  ) -> Result[Database, OpenError] {
+  # Opens a new read-only database connection to the database located at `path`.
+  #
+  # This method expects that the database already exists and produces an error
+  # if this isn't the case.
+  #
+  # For more details, refer to the documentation of `Database.new`.
+  #
+  # # Examples
+  #
+  # Opening an in-memory database in read-only mode (which isn't terribly
+  # useful, but technically possible):
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # Database.read_only(':memory:').or_panic
+  # ```
+  #
+  # Opening a database stored on disk in read-only mode (this requires that the
+  # database already exists):
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # Database.read_only('example.db').or_panic
+  # ```
+  fn pub static read_only[T: ToString](path: ref T) -> Result[Database, Error] {
     open(path, flags: SQLITE_OPEN_READONLY)
+  }
+
+  fn mut apply_reasonable_defaults -> Result[Nil, Error] {
+    try execute('PRAGMA journal_mode = WAL')
+    try execute('PRAGMA busy_timeout = 5000')
+    try execute('PRAGMA synchronous = NORMAL')
+    try execute('PRAGMA cache_size = 2048')
+    try execute('PRAGMA foreign_keys = true')
+    try execute('PRAGMA temp_store = memory')
+    Result.Ok(nil)
+  }
+
+  # Prepares a new SQL statement using the provided SQL string.
+  #
+  # You _must not_ include user-provided input in the `query` argument as this
+  # exposes you to SQL injection attacks. Instead, prepare a query using
+  # [placeholders/parameters](https://sqlite.org/lang_expr.html#varparam) and
+  # bind values to those parameters using `Statement.bind`.
+  #
+  # # Errors
+  #
+  # If the `query` value is greater than 2³²-1, an `Error.TooLarge` error is
+  # returned. In addition, SQLite may produce an error for different reasons
+  # such as when the SQL string is invalid.
+  #
+  # If the input string is invalid SQL, an `Error.Generic` is produced.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT 1').or_panic
+  # ```
+  fn pub mut prepare[B: Bytes](query: ref B) -> Result[Statement, Error] {
+    let len = query.size
+
+    if len > I32_MAX { throw Error.TooLarge }
+
+    let handle = null
+    let len = len as Int32
+    let res = sqlite3_prepare_v2(@handle, query.pointer, len, mut handle, null)
+
+    match res as Int {
+      case SQLITE_OK -> Result.Ok(Statement(db: self, handle: handle))
+      case v -> throw Error.new(v)
+    }
+  }
+
+  # Executes the statement and returns the number of modified (e.g. inserted)
+  # rows.
+  #
+  # Refer to the documentation of `Database.prepare` and `Statement.execute` for
+  # more details.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  #
+  # db.execute('CREATE TABLE users (name TEXT)')     # => Result.Ok(0)
+  # db.execute('INSERT INTO users VALUES ("Alice")') # => Result.Ok(1)
+  # ```
+  fn pub mut execute[B: Bytes](query: ref B) -> Result[Int, Error] {
+    let st = try prepare(query)
+
+    st.execute
+  }
+
+  # Returns the number of rows modified by the most recently executed statement.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  #
+  # db.execute('CREATE TABLE users (name TEXT)')     # => Result.Ok(0)
+  # db.execute('INSERT INTO users VALUES ("Alice")') # => Result.Ok(1)
+  #
+  # db.changes # => 1
+  # ```
+  fn pub changes -> Int {
+    sqlite3_changes64(@handle) as Int
+  }
+
+  # Returns the "rowid" value of the last inserted row, or zero if no row is
+  # inserted yet.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  #
+  # db.execute('CREATE TABLE users (name TEXT)')     # => Result.Ok(0)
+  # db.execute('INSERT INTO users VALUES ("Alice")') # => Result.Ok(1)
+  #
+  # db.last_inserted_row_id # => 1
+  # ```
+  fn pub last_inserted_row_id -> Int {
+    sqlite3_last_insert_rowid(@handle)
+  }
+
+  # Returns a `Blob` for the given table, column and row ID.
+  #
+  # The `database` argument is the symbolic name of the database. Usually this
+  # is just "main", though the use of the `MAIN_DB` constant for this is
+  # preferred in case this ever changes.
+  #
+  # The `table` argument is the name of the table storing the blob, while
+  # `column` is the name of the `BLOB` column.
+  #
+  # The `row` argument is the rowid of the row. You can use
+  # `Database.last_inserted_row_id` to acquire such an ID after an `INSERT`.
+  #
+  # The `write` argument specifies if the blob should be opened in read-only
+  # mode (`false`) or in read-write mode (`true`).
+  #
+  # # Errors
+  #
+  # If the blob can't be opened, such as when the table or column doesn't exist,
+  # an `Error.Generic` is returned. For more details, refer to the [SQLite
+  # documentation](https://sqlite.org/c3ref/blob_open.html).
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database, MAIN_DB)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let _ = db.execute('CREATE TABLE files (name TEXT, data BLOB)').or_panic
+  # let st = db.prepare('INSERT INTO files VALUES (:name, :data)').or_panic
+  # let val = 'This is an example'
+  #
+  # st.bind(':name', 'README.md').or_panic
+  # st.bind(':data', val.to_byte_array).or_panic
+  #
+  # let _ = st.execute.or_panic
+  # let id = db.last_inserted_row_id
+  #
+  # db
+  #   .blob(MAIN_DB, table: 'files', column: 'data', row: id, write: false)
+  #   .or_panic
+  # ```
+  fn pub blob(
+    database: String,
+    table: String,
+    column: String,
+    row: Int,
+    write: Bool,
+  ) -> Result[Blob, Error] {
+    let rw = write.to_int as Int32
+    let handle = null
+    let db = database.pointer
+    let tbl = table.pointer
+    let col = column.pointer
+    let res = sqlite3_blob_open(@handle, db, tbl, col, row, rw, mut handle)
+
+    match res as Int {
+      case SQLITE_OK -> {}
+      case v -> throw Error.new(v)
+    }
+
+    Result.Ok(Blob.new(handle))
+  }
+
+  fn inline last_error -> Result[Nil, Error] {
+    match sqlite3_errcode(@handle) as Int {
+      case SQLITE_OK or SQLITE_ROW -> Result.Ok(nil)
+      case v -> throw Error.new(v)
+    }
   }
 }
 
-type pub inline Statement {
-  fn pub mut bind(column: Int, value: String) -> Result[Nil, String] {
-    Result.Error('TODO')
+impl Drop for Database {
+  fn mut drop {
+    sqlite3_close(@handle)
+  }
+}
+
+# A handle to a SQLite `BLOB` value.
+#
+# Data is read using `Blob.read`, while writes are performed using `Blob.write`.
+# If a write is performed on a `Blob` that is opened in read-only mode then a
+# `Error.ReadOnly` error is produced. To read/write starting at a specific
+# offset, use `Blob.seek` to set the start offset followed by a call to
+# `Blob.read` or `Blob.write`. These calls don't modify the offset, so don't
+# forget to reset it yourself whenever necessary.
+type pub Blob {
+  let @handle: Pointer[Uint8]
+  let mut @offset: Int
+
+  fn static new(handle: Pointer[Uint8]) -> Self {
+    Self(handle: handle, offset: 0)
+  }
+
+  # Returns the size of `self` in _bytes_.
+  fn pub size -> Int {
+    sqlite3_blob_bytes(@handle) as Int
+  }
+}
+
+impl Seek[IoError] for Blob {
+  fn pub mut seek(position: SeekFrom) -> Result[Int, IoError] {
+    let new = match position {
+      case Start(v) -> v
+      case Current(v) -> @offset + v
+      case End(v) -> size - v
+    }
+
+    if new < 0 { throw IoError.InvalidSeek }
+
+    @offset = new
+    Result.Ok(@offset)
+  }
+}
+
+impl Read[Error] for Blob {
+  fn pub mut read_all(bytes: mut ByteArray) -> Result[Int, Error] {
+    read(into: bytes, size: size)
+  }
+
+  fn pub mut read(into: mut ByteArray, size: Int) -> Result[Int, Error] {
+    let size = min(size, self.size - @offset)
+
+    into.reserve_exact(size)
+
+    let len = size as Int32
+    let off = @offset as Int32
+
+    match sqlite3_blob_read(@handle, into.pointer, len, off) as Int {
+      case SQLITE_OK -> {
+        into.size = into.size + size
+        Result.Ok(size)
+      }
+      case v -> throw Error.new(v)
+    }
+  }
+}
+
+impl Write[Error] for Blob {
+  fn pub mut write[B: Bytes](bytes: ref B) -> Result[Nil, Error] {
+    let len = bytes.size as Int32
+    let off = @offset as Int32
+
+    match sqlite3_blob_write(@handle, bytes.pointer, len, off) as Int {
+      case SQLITE_OK -> Result.Ok(nil)
+      case v -> throw Error.new(v)
+    }
+  }
+
+  fn pub mut flush -> Result[Nil, Error] {
+    Result.Ok(nil)
+  }
+}
+
+impl Drop for Blob {
+  fn mut drop {
+    sqlite3_blob_close(@handle)
+  }
+}
+
+# An iterator over the rows produced by a prepared statement.
+type pub inline Rows {
+  let @statement: mut Statement
+}
+
+impl Iter[Result[Row, Error]] for Rows {
+  fn pub mut next -> Option[Result[Row, Error]] {
+    match sqlite3_step(@statement.handle) as Int {
+      case SQLITE_ROW -> Option.Some(Result.Ok(Row(@statement)))
+      case SQLITE_DONE -> Option.None
+      case v -> Option.Some(Result.Error(Error.new(v)))
+    }
+  }
+}
+
+# A single row produced by the `Rows` iterator.
+type pub inline Row {
+  let @statement: mut Statement
+
+  # Returns the number of columns in this row.
+  fn pub inline number_of_columns -> Int {
+    @statement.number_of_columns
+  }
+
+  # Reads a column value as an `Int`.
+  #
+  # If the type of the column is not `INTEGER` a conversion takes place
+  # according to the [SQLite type conversion
+  # rules](https://sqlite.org/c3ref/column_blob.html).
+  #
+  # # Errors
+  #
+  # This method returns an `Error.InvalidColumn` if `index` is out of bounds or
+  # if the statement this `Row` belongs to is reset.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT 1').or_panic
+  # let row = st.rows.next.get.or_panic
+  #
+  # row.int(0) # => Result.Ok(1)
+  # ```
+  fn pub int(index: Int) -> Result[Int, Error] {
+    try check_bounds(index)
+
+    let col = index as Int32
+    let stm = @statement.handle
+
+    Result.Ok(sqlite3_column_int64(stm, col))
+  }
+
+  # Reads a column value as an `Int` and converts it to a `Bool`.
+  #
+  # If the integer value is zero then `false` is returned. For any other value,
+  # `true` is returned instead.
+  #
+  # Refer to the documentation of `Row.int` for more details.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT 1').or_panic
+  # let row = st.rows.next.get.or_panic
+  #
+  # row.bool(0) # => Result.Ok(true)
+  # ```
+  fn pub bool(index: Int) -> Result[Bool, Error] {
+    match try int(index) {
+      case 0 -> Result.Ok(false)
+      case _ -> Result.Ok(true)
+    }
+  }
+
+  # Reads a column value as a `Float`.
+  #
+  # If the type of the column is not `REAL` a conversion takes place according
+  # to the [SQLite type conversion
+  # rules](https://sqlite.org/c3ref/column_blob.html).
+  #
+  # # Errors
+  #
+  # This method returns an `Error.InvalidColumn` if `index` is out of bounds or
+  # if the statement this `Row` belongs to is reset.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT 1.5').or_panic
+  # let row = st.rows.next.get.or_panic
+  #
+  # row.float(0) # => Result.Ok(1.5)
+  # ```
+  fn pub float(index: Int) -> Result[Float, Error] {
+    try check_bounds(index)
+
+    let col = index as Int32
+    let stm = @statement.handle
+
+    Result.Ok(sqlite3_column_double(stm, col))
+  }
+
+  # Reads a column value as a `String`.
+  #
+  # If the type of the column is not `TEXT` or `BLOB`, a conversion takes place
+  # according to the [SQLite type conversion
+  # rules](https://sqlite.org/c3ref/column_blob.html).
+  #
+  # This method allocates a new `String` on each call.
+  #
+  # # Errors
+  #
+  # This method returns an `Error.InvalidColumn` if `index` is out of bounds or
+  # if the statement this `Row` belongs to is reset.
+  #
+  # If SQLite fails to allocate the necessary memory to read the column value,
+  # an `Error.NoMemory` error is returned.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT "hello"').or_panic
+  # let row = st.rows.next.get.or_panic
+  #
+  # row.string(0) # => Result.Ok('hello')
+  # ```
+  fn pub string(index: Int) -> Result[String, Error] {
+    try check_bounds(index)
+
+    let col = index as Int32
+    let stm = @statement.handle
+    let ptr = sqlite3_column_blob(stm, col)
+
+    try check_allocation(ptr)
+
+    let len = sqlite3_column_bytes(stm, col) as Int
+
+    Result.Ok(String.from_pointer_and_size(ptr, len))
+  }
+
+  # Reads a column value as a `ByteArray`.
+  #
+  # If the type of the column is not `TEXT` or `BLOB`, a conversion takes place
+  # according to the [SQLite type conversion
+  # rules](https://sqlite.org/c3ref/column_blob.html).
+  #
+  # This method allocates a new `ByteArray` on each call.
+  #
+  # # Errors
+  #
+  # This method returns an `Error.InvalidColumn` if `index` is out of bounds or
+  # if the statement this `Row` belongs to is reset.
+  #
+  # If SQLite fails to allocate the necessary memory to read the column value,
+  # an `Error.NoMemory` error is returned.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT "hello"').or_panic
+  # let row = st.rows.next.get.or_panic
+  #
+  # row.bytes(0) # => Result.Ok('hello'.to_byte_array)
+  # ```
+  fn pub bytes(index: Int) -> Result[ByteArray, Error] {
+    try check_bounds(index)
+
+    let col = index as Int32
+    let stm = @statement.handle
+    let ptr = sqlite3_column_blob(stm, col)
+
+    try check_allocation(ptr)
+
+    let len = sqlite3_column_bytes(stm, col) as Int
+
+    Result.Ok(ByteArray.from_pointer(ptr, len))
+  }
+
+  fn inline check_bounds(index: Int) -> Result[Nil, Error] {
+    let cols = number_of_columns
+
+    if index >= 0 and index < cols and @statement.busy? {
+      Result.Ok(nil)
+    } else {
+      throw Error.InvalidColumn
+    }
+  }
+
+  fn inline check_allocation(ptr: Pointer[Uint8]) -> Result[Nil, Error] {
+    if ptr as Int == (null as Int) {
+      @statement.db.last_error
+    } else {
+      Result.Ok(nil)
+    }
+  }
+}
+
+# A prepared SQL statement to execute.
+type pub Statement {
+  let @db: mut Database
+  let @handle: Pointer[Uint8]
+
+  # Binds a value to a column.
+  #
+  # `column` can either be an `Int` or a `String`. If an `Int`, it's treated as
+  # the column index starting at index 0 (not at index 1, unlike the SQLite C
+  # API).
+  #
+  # If a `String`, it's used as a named SQL parameter. In this case the `String`
+  # must start with `:`, `@` or `$` otherwise an `Error.InvalidColumn` error is
+  # produced.
+  #
+  # The `value` argument may be a value of one of the following types:
+  #
+  # - `Int` (treated as INTEGER)
+  # - `Float` (treated as REAL)
+  # - `Bool` (treated as INTEGER)
+  # - `Nil` (treated as NULL)
+  # - `String` (treated as TEXT)
+  # - `ByteArray` (treated as BLOB)
+  #
+  # # Errors
+  #
+  # If the column index is out of bounds or otherwise invalid, an
+  # `Error.InvalidColumn` is produced. SQLite may also produce errors for
+  # various cases, for more information refer to the [SQLite
+  # documentation](https://sqlite.org/c3ref/bind_blob.html).
+  #
+  # # Examples
+  #
+  # Binding a positional parameter:
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT ?').or_panic
+  #
+  # st.bind(column: 0, value: 10) # => Result.Ok(nil)
+  # ```
+  #
+  # Binding a named parameter:
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT :value').or_panic
+  #
+  # st.bind(column: ':value', value: 10) # => Result.Ok(nil)
+  # ```
+  fn pub mut bind[I: BindIndex, V: BindValue](
+    column: I,
+    value: ref V,
+  ) -> Result[Nil, Error] {
+    let col = try bind_column_index(column)
+
+    match value.bind_sqlite_value(@handle, col) {
+      case SQLITE_OK -> Result.Ok(nil)
+      case v -> throw Error.new(v)
+    }
+  }
+
+  # Binds a blob with `size` zeroes to a column.
+  #
+  # If `size` is less than zero, the blob is empty as if the size were zero
+  # instead.
+  #
+  # This method is meant to be used for creating a placeholder `BLOB` value that
+  # is later updated by acquiring a `Blob` through `Database.blob`, as SQLite
+  # offers no API to resize existing blobs.
+  #
+  # Refer to the documentation of `Statement.bind` for more details.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT ?').or_panic
+  #
+  # st.bind_blob(column: 0, size: 32) # => Result.Ok(nil)
+  # ```
+  fn pub mut bind_blob[I: BindIndex](column: I, size: Int) -> Result[Nil, Error]
+  {
+    let col = try bind_column_index(column)
+    let len = max(0, size)
+
+    match sqlite3_bind_zeroblob64(@handle, col as Int32, len as Uint64) as Int {
+      case SQLITE_OK -> Result.Ok(nil)
+      case v -> throw Error.new(v)
+    }
+  }
+
+  # Executes the statement and returns the number of modified (e.g. inserted)
+  # rows.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let _ = db.execute('CREATE TABLE users (name TEXT)').or_panic
+  # let st = db.prepare('INSERT INTO users VALUES ("Alice")').or_panic
+  #
+  # st.execute # => Result.Ok(1)
+  # ```
+  fn pub mut execute -> Result[Int, Error] {
+    match sqlite3_step(@handle) as Int {
+      case SQLITE_ROW or SQLITE_DONE -> Result.Ok(@db.changes)
+      case v -> throw Error.new(v)
+    }
+  }
+
+  # Returns an iterator over the rows produced by this statement.
+  #
+  # The statement is not executed until the first call to `Rows.next`.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT 1').or_panic
+  #
+  # st.rows.count # => 1
+  # ```
+  fn pub inline mut rows -> Rows {
+    Rows(self)
+  }
+
+  # Returns the number of columns produced by this statement.
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT 1').or_panic
+  #
+  # st.number_of_columns # => 1
+  # ```
+  fn pub inline number_of_columns -> Int {
+    sqlite3_column_count(@handle) as Int
+  }
+
+  # Resets the statement to its initial state and clears all bound values.
+  #
+  # # Errors
+  #
+  # This method may return an `Error` based on the result of the last call to
+  # `Statement.execute` or `Rows.next?`. For more details, refer to the [SQLite
+  # documentation](https://sqlite.org/c3ref/reset.html).
+  #
+  # # Examples
+  #
+  # ```inko
+  # import sqlite (Database)
+  #
+  # let db = Database.new(':memory:').or_panic
+  # let st = db.prepare('SELECT 1').or_panic
+  #
+  # st.reset # => Result.Ok(nil)
+  # ```
+  fn pub mut reset -> Result[Nil, Error] {
+    match sqlite3_reset(@handle) as Int {
+      case SQLITE_OK -> sqlite3_clear_bindings(@handle)
+      case v -> throw Error.new(v)
+    }
+
+    Result.Ok(nil)
+  }
+
+  fn inline busy? -> Bool {
+    sqlite3_stmt_busy(@handle) as Int == 1
+  }
+
+  fn inline bind_column_index[I: BindIndex](column: I) -> Result[Int, Error] {
+    let idx = column.bind_sqlite_index(@handle)
+
+    if idx <= 0 or idx > I32_MAX { throw Error.InvalidColumn }
+
+    Result.Ok(idx)
+  }
+}
+
+impl Drop for Statement {
+  fn mut drop {
+    sqlite3_finalize(@handle)
   }
 }

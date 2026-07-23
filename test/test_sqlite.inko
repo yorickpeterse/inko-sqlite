@@ -1,5 +1,763 @@
+import sqlite (
+  Database, Error, MAIN_DB, Row, SQLITE_ABORT, SQLITE_BUSY, SQLITE_CANTOPEN,
+  SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_ERROR, SQLITE_FULL, SQLITE_IOERR,
+  SQLITE_MISMATCH, SQLITE_NOMEM, SQLITE_NOTADB, SQLITE_PROTOCOL, SQLITE_RANGE,
+  SQLITE_READONLY, SQLITE_SCHEMA, SQLITE_TOOBIG,
+)
+import std.array (OutOfBounds)
+import std.bytes (Bytes, ToByteArray)
+import std.env (temporary_directory)
+import std.fmt (fmt)
+import std.int (MAX as INT_MAX)
+import std.io (Error as IoError, SeekFrom)
+import std.ptr (null)
+import std.string (ToString)
 import std.test (Tests)
 
+type copy TooLarge {}
+
+impl ToString for TooLarge {
+  fn pub to_string -> String {
+    ''
+  }
+}
+
+impl ToByteArray for TooLarge {
+  fn pub to_byte_array -> ByteArray {
+    ByteArray.new
+  }
+}
+
+impl Bytes for TooLarge {
+  fn pub size -> Int {
+    INT_MAX
+  }
+
+  fn pub get(index: Int) -> Result[Int, OutOfBounds] {
+    throw OutOfBounds.new(index, size: 0)
+  }
+
+  fn pub pointer -> Pointer[Uint8] {
+    null
+  }
+}
+
 fn pub tests(t: mut Tests) {
-  # TODO
+  t.test('Error.new', fn (t) {
+    t.equal(Error.new(SQLITE_ABORT), Error.Aborted)
+    t.equal(Error.new(SQLITE_BUSY), Error.Busy)
+    t.equal(Error.new(SQLITE_NOMEM), Error.NoMemory)
+    t.equal(Error.new(SQLITE_READONLY), Error.ReadOnly)
+    t.equal(Error.new(SQLITE_IOERR), Error.Io)
+    t.equal(Error.new(SQLITE_CORRUPT), Error.InvalidFile)
+    t.equal(Error.new(SQLITE_CANTOPEN), Error.InvalidFile)
+    t.equal(Error.new(SQLITE_MISMATCH), Error.InvalidFile)
+    t.equal(Error.new(SQLITE_NOTADB), Error.InvalidFile)
+    t.equal(Error.new(SQLITE_FULL), Error.Full)
+    t.equal(Error.new(SQLITE_PROTOCOL), Error.LockFailed)
+    t.equal(Error.new(SQLITE_SCHEMA), Error.SchemaChanged)
+    t.equal(Error.new(SQLITE_TOOBIG), Error.TooLarge)
+    t.equal(Error.new(SQLITE_CONSTRAINT), Error.Constraint)
+    t.equal(Error.new(SQLITE_RANGE), Error.InvalidColumn)
+    t.equal(Error.new(SQLITE_ERROR), Error.Generic)
+  })
+
+  t.test('Error.==', fn (t) {
+    t.equal(Error.Aborted, Error.Aborted)
+    t.equal(Error.Other(1), Error.Other(1))
+    t.not_equal(Error.Aborted, Error.Busy)
+    t.not_equal(Error.Other(1), Error.Other(2))
+    t.not_equal(Error.Other(1), Error.Aborted)
+  })
+
+  t.test('Error.to_string', fn (t) {
+    t.equal(Error.Aborted.to_string, 'the operation was aborted')
+    t.equal(Error.Other(100).to_string, 'another row available')
+  })
+
+  t.test('Error.fmt', fn (t) {
+    t.equal(fmt(Error.Aborted), 'Aborted')
+    t.equal(fmt(Error.Busy), 'Busy')
+    t.equal(fmt(Error.InvalidFile), 'InvalidFile')
+    t.equal(fmt(Error.Constraint), 'Constraint')
+    t.equal(fmt(Error.Full), 'Full')
+    t.equal(fmt(Error.Io), 'Io')
+    t.equal(fmt(Error.InvalidType), 'InvalidType')
+    t.equal(fmt(Error.NoMemory), 'NoMemory')
+    t.equal(fmt(Error.LockFailed), 'LockFailed')
+    t.equal(fmt(Error.InvalidColumn), 'InvalidColumn')
+    t.equal(fmt(Error.ReadOnly), 'ReadOnly')
+    t.equal(fmt(Error.SchemaChanged), 'SchemaChanged')
+    t.equal(fmt(Error.TooLarge), 'TooLarge')
+    t.equal(fmt(Error.Generic), 'Generic')
+    t.equal(fmt(Error.Other(10)), 'Other(10)')
+  })
+
+  t.test('Database.new with a non-existing database', fn (t) {
+    let path = temporary_directory.join('inko-sqlite-${t.id}.db')
+    let db = Database.new(path)
+
+    t.equal(db.error, Option.None)
+
+    let _ = path.remove_file
+  })
+
+  t.test('Database.new with an in-memory database', fn (t) {
+    let db = Database.new(':memory:')
+
+    t.equal(db.error, Option.None)
+  })
+
+  t.ok('Database.new applies a set of reasonable defaults', fn (t) {
+    let path = temporary_directory.join('inko-sqlite-${t.id}.db')
+    let db = try Database.new(path)
+    let pragmas = [
+      ('journal_mode', 'wal'),
+      ('busy_timeout', '5000'),
+      ('synchronous', '1'),
+      ('cache_size', '2048'),
+      ('foreign_keys', '1'),
+      ('temp_store', '2'),
+    ]
+
+    for (pragma, exp) in pragmas {
+      let st = try db.prepare('PRAGMA ${pragma}')
+      let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+      t.equal(row.string(0), Result.Ok(exp))
+    }
+
+    let _ = path.remove_file
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Database.prepare with a valid query size', fn (t) {
+    let db = try Database.new(':memory:')
+
+    t.equal(db.prepare('SELECT 1').error, Option.None)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Database.prepare with an invalid query size', fn (t) {
+    let db = try Database.new(':memory:')
+
+    t.equal(db.prepare(TooLarge()).error, Option.Some(Error.TooLarge))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Database.prepare with an invalid SQL string', fn (t) {
+    let db = try Database.new(':memory:')
+
+    t.equal(db.prepare('SELECT').error, Option.Some(Error.Generic))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Database.prepare with empty input', fn (t) {
+    let db = try Database.new(':memory:')
+
+    t.equal(db.prepare('').error, Option.None)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Database.changes with a SELECT', fn (t) {
+    let db = try Database.new(':memory:')
+
+    t.equal(db.execute('SELECT 1'), Result.Ok(0))
+    t.equal(db.changes, 0)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Database.changes with an INSERT', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.execute('CREATE TABLE foo (name TEXT)')
+    try db.execute('INSERT INTO foo VALUES ("A")')
+
+    t.equal(db.changes, 1)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Database.last_inserted_row_id', fn (t) {
+    let db = try Database.new(':memory:')
+
+    t.equal(db.last_inserted_row_id, 0)
+
+    try db.execute('CREATE TABLE foo (name TEXT)')
+    try db.execute('INSERT INTO foo VALUES ("A")')
+
+    t.equal(db.last_inserted_row_id, 1)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Blob.size', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.execute('CREATE TABLE blobs (value BLOB)')
+    try db.execute('INSERT INTO blobs VALUES ("hello")')
+
+    let id = db.last_inserted_row_id
+    let blob = try db.blob(MAIN_DB, 'blobs', 'value', id, write: false)
+
+    t.equal(blob.size, 5)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Blob.seek', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.execute('CREATE TABLE blobs (value BLOB)')
+    try db.execute('INSERT INTO blobs VALUES ("hello")')
+
+    let id = db.last_inserted_row_id
+    let blob = try db.blob(MAIN_DB, 'blobs', 'value', id, write: false)
+
+    t.equal(blob.seek(SeekFrom.Start(10)), Result.Ok(10))
+    t.equal(blob.offset, 10)
+
+    t.equal(blob.seek(SeekFrom.Current(5)), Result.Ok(15))
+    t.equal(blob.offset, 15)
+
+    t.equal(blob.seek(SeekFrom.End(3)), Result.Ok(2))
+    t.equal(blob.offset, 2)
+
+    t.equal(blob.seek(SeekFrom.Start(100)), Result.Ok(100))
+    t.equal(blob.seek(SeekFrom.Current(100)), Result.Ok(200))
+    t.equal(blob.seek(SeekFrom.End(100)), Result.Error(IoError.InvalidSeek))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Blob.read', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.execute('CREATE TABLE blobs (value BLOB)')
+    try db.execute('INSERT INTO blobs VALUES ("hello")')
+
+    let id = db.last_inserted_row_id
+    let blob = try db.blob(MAIN_DB, 'blobs', 'value', id, write: false)
+    let buf = ByteArray.new
+
+    t.equal(blob.read(into: buf, size: 5), Result.Ok(5))
+    t.equal(buf.drain_to_string, 'hello')
+
+    t.equal(blob.read(into: buf, size: 5), Result.Ok(5))
+    t.equal(buf.drain_to_string, 'hello')
+
+    t.equal(blob.read(into: buf, size: 3), Result.Ok(3))
+    t.equal(buf.drain_to_string, 'hel')
+
+    t.equal(blob.read(into: buf, size: 100), Result.Ok(5))
+    t.equal(buf.drain_to_string, 'hello')
+
+    t.equal(blob.seek(SeekFrom.Start(2)), Result.Ok(2))
+    t.equal(blob.read(into: buf, size: 10), Result.Ok(3))
+    t.equal(buf.drain_to_string, 'llo')
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Blob.read_all', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.execute('CREATE TABLE blobs (value BLOB)')
+    try db.execute('INSERT INTO blobs VALUES ("hello")')
+
+    let id = db.last_inserted_row_id
+    let blob = try db.blob(MAIN_DB, 'blobs', 'value', id, write: false)
+    let buf = ByteArray.new
+
+    t.equal(blob.read_all(buf), Result.Ok(5))
+    t.equal(buf.drain_to_string, 'hello')
+    t.equal(blob.read_all(buf), Result.Ok(5))
+    t.equal(buf.drain_to_string, 'hello')
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Blob.write', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.execute('CREATE TABLE blobs (value BLOB)')
+    try db.execute('INSERT INTO blobs VALUES ("hello")')
+
+    let id = db.last_inserted_row_id
+    let blob = try db.blob(MAIN_DB, 'blobs', 'value', id, write: true)
+    let buf = ByteArray.new
+
+    t.equal(blob.write('abc'), Result.Ok(nil))
+    t.equal(blob.read(into: buf, size: 10), Result.Ok(5))
+    t.equal(buf.drain_to_string, 'abclo')
+
+    t.equal(blob.write('hello world'), Result.Error(Error.Generic))
+    t.equal(buf.drain_to_string, '')
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.execute with a SELECT', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT 1')
+
+    t.equal(st.execute, Result.Ok(0))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.execute with an INSERT', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.prepare('CREATE TABLE foo (name TEXT)').then(fn (s) { s.execute })
+
+    let st = try db.prepare('INSERT INTO foo VALUES ("A")')
+
+    t.equal(st.execute, Result.Ok(1))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a positional Int parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind(0, 1), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.int(0), Result.Ok(1))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a positional Float parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind(0, 1.5), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.float(0), Result.Ok(1.5))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a positional Bool parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?, ?')
+
+    t.equal(st.bind(0, true), Result.Ok(nil))
+    t.equal(st.bind(1, false), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.bool(0), Result.Ok(true))
+    t.equal(row.bool(1), Result.Ok(false))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a positional Nil parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind(0, nil), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.int(0), Result.Ok(0))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a positional String parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind(0, 'hello'), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.string(0), Result.Ok('hello'))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a positional ByteArray parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind(0, 'hello'.to_byte_array), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.bytes(0), Result.Ok('hello'.to_byte_array))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a named Int parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :val')
+
+    t.equal(st.bind(':val', 1), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.int(0), Result.Ok(1))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a named Float parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :val')
+
+    t.equal(st.bind(':val', 1.5), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.float(0), Result.Ok(1.5))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a named Bool parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :a, :b')
+
+    t.equal(st.bind(':a', true), Result.Ok(nil))
+    t.equal(st.bind(':b', false), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.bool(0), Result.Ok(true))
+    t.equal(row.bool(1), Result.Ok(false))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a named Nil parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :val')
+
+    t.equal(st.bind(':val', nil), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.int(0), Result.Ok(0))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a named String parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :val')
+
+    t.equal(st.bind(':val', 'hello'), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.string(0), Result.Ok('hello'))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with a named ByteArray parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :val')
+
+    t.equal(st.bind(':val', 'hello'.to_byte_array), Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.bytes(0), Result.Ok('hello'.to_byte_array))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with an out of bounds positional parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind(10, 1), Result.Error(Error.InvalidColumn))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind with an undefined named parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :val')
+
+    t.equal(st.bind(':whatever', 1), Result.Error(Error.InvalidColumn))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind_blob with a positional parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind_blob(0, 5), Result.Ok(nil))
+
+    let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+    t.equal(row.bytes(0), Result.Ok(ByteArray.from_array([0, 0, 0, 0, 0])))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind_blob with a named parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :val')
+
+    t.equal(st.bind_blob(':val', 5), Result.Ok(nil))
+
+    let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+    t.equal(row.bytes(0), Result.Ok(ByteArray.from_array([0, 0, 0, 0, 0])))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind_blob with an undefined named parameter', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT :a')
+
+    t.equal(st.bind_blob(':b', 5), Result.Error(Error.InvalidColumn))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.bind_blob with a negative size', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind_blob(0, -5), Result.Ok(nil))
+
+    let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+    t.equal(row.bytes(0), Result.Ok(ByteArray.new))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.number_of_columns', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT 1, 2')
+
+    t.equal(st.number_of_columns, 2)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.reset rewinds the statement', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT 1')
+
+    t.equal(st.execute, Result.Ok(0))
+    t.equal(st.reset, Result.Ok(nil))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.reset clears all bindings', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT ?')
+
+    t.equal(st.bind(0, 1), Result.Ok(nil))
+    t.equal(st.reset, Result.Ok(nil))
+
+    let rows = st.rows
+    let Some(Ok(row)) = rows.next else throw Error.Generic
+
+    t.equal(row.int(0), Result.Ok(0))
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Statement.busy?', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT 1')
+
+    t.false(st.busy?)
+
+    let rows = st.rows
+
+    t.false(st.busy?)
+    t.true(rows.next.some?)
+    t.true(st.busy?)
+    t.true(rows.next.none?)
+    t.false(st.busy?)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Rows.next', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT 1')
+    let rows = st.rows
+
+    t.equal(rows.next.map(fn (r) { r.ok? }), Option.Some(true))
+    t.equal(rows.next.map(fn (r) { r.ok? }), Option.None)
+    t.equal(rows.next.map(fn (r) { r.ok? }), Option.Some(true))
+    t.equal(rows.next.map(fn (r) { r.ok? }), Option.None)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Row.number_of_columns', fn (t) {
+    let db = try Database.new(':memory:')
+    let st = try db.prepare('SELECT 1')
+
+    t.equal(Row(st).number_of_columns, 1)
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Row.int', fn (t) {
+    let db = try Database.new(':memory:')
+    let tests = [
+      ('10', Result.Ok(10)),
+      ('-10', Result.Ok(-10)),
+      ('"10"', Result.Ok(10)),
+      ('10.5', Result.Ok(10)),
+      ('NULL', Result.Ok(0)),
+    ]
+
+    for (inp, exp) in tests {
+      let st = try db.prepare('SELECT ${inp}')
+
+      t.equal(Row(st).int(0), Result.Error(Error.InvalidColumn))
+
+      let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+      t.equal(row.int(0), exp)
+      t.equal(st.reset, Result.Ok(nil))
+      t.equal(row.int(0), Result.Error(Error.InvalidColumn))
+    }
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Row.bool', fn (t) {
+    let db = try Database.new(':memory:')
+    let tests = [
+      ('1', Result.Ok(true)),
+      ('10', Result.Ok(true)),
+      ('-10', Result.Ok(true)),
+      ('"10"', Result.Ok(true)),
+      ('10.5', Result.Ok(true)),
+      ('0', Result.Ok(false)),
+      ('NULL', Result.Ok(false)),
+    ]
+
+    for (inp, exp) in tests {
+      let st = try db.prepare('SELECT ${inp}')
+
+      t.equal(Row(st).bool(0), Result.Error(Error.InvalidColumn))
+
+      let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+      t.equal(row.bool(0), exp)
+      t.equal(st.reset, Result.Ok(nil))
+      t.equal(row.bool(0), Result.Error(Error.InvalidColumn))
+    }
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Row.float', fn (t) {
+    let db = try Database.new(':memory:')
+    let tests = [
+      ('10.5', Result.Ok(10.5)),
+      ('"10.5"', Result.Ok(10.5)),
+      ('10', Result.Ok(10.0)),
+      ('NULL', Result.Ok(0.0)),
+    ]
+
+    for (inp, exp) in tests {
+      let st = try db.prepare('SELECT ${inp}')
+
+      t.equal(Row(st).float(0), Result.Error(Error.InvalidColumn))
+
+      let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+      t.equal(row.float(0), exp)
+      t.equal(st.reset, Result.Ok(nil))
+      t.equal(row.float(0), Result.Error(Error.InvalidColumn))
+    }
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Row.string', fn (t) {
+    let db = try Database.new(':memory:')
+    let tests = [
+      ('10', Result.Ok('10')),
+      ('"10"', Result.Ok('10')),
+      ('"foo\nbar"', Result.Ok('foo\nbar')),
+      ('10.5', Result.Ok('10.5')),
+      ('NULL', Result.Ok('')),
+    ]
+
+    for (inp, exp) in tests {
+      let st = try db.prepare('SELECT ${inp}')
+
+      t.equal(Row(st).string(0), Result.Error(Error.InvalidColumn))
+
+      let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+      t.equal(row.string(0), exp)
+      t.equal(st.reset, Result.Ok(nil))
+      t.equal(row.string(0), Result.Error(Error.InvalidColumn))
+    }
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Row.bytes', fn (t) {
+    let db = try Database.new(':memory:')
+    let tests = [
+      ('10', Result.Ok('10'.to_byte_array)),
+      ('"10"', Result.Ok('10'.to_byte_array)),
+      ('"foo\nbar"', Result.Ok('foo\nbar'.to_byte_array)),
+      ('10.5', Result.Ok('10.5'.to_byte_array)),
+      ('NULL', Result.Ok(ByteArray.new)),
+    ]
+
+    for (inp, exp) in tests {
+      let st = try db.prepare('SELECT ${inp}')
+
+      t.equal(Row(st).bytes(0), Result.Error(Error.InvalidColumn))
+
+      let Some(Ok(row)) = st.rows.next else throw Error.Generic
+
+      t.equal(row.bytes(0), exp)
+      t.equal(st.reset, Result.Ok(nil))
+      t.equal(row.bytes(0), Result.Error(Error.InvalidColumn))
+    }
+
+    Result.Ok(nil)
+  })
 }
