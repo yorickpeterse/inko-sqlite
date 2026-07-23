@@ -1,0 +1,162 @@
+# Low-level bindings to [SQLite](https://sqlite.org/index.html).
+#
+# # Requirements
+#
+# The bindings provided by this module use the SQLite C API and require that a
+# SQLite shared or static library is available to link against. For example, on
+# Fedora you'll need to install the `sqlite-libs` package.
+import extern "sqlite3"
+
+import std.cmp (Equal)
+import std.fmt (Format, Formatter)
+import std.ptr (null)
+import std.reflect (enum_tag)
+import std.string (ToString)
+
+let SQLITE_OK = 0
+let SQLITE_DONE = 101
+let SQLITE_UTF8 = 1
+let SQLITE_TRANSIENT = -1
+let SQLITE_OPEN_READONLY = 0x00000001
+let SQLITE_OPEN_READWRITE = 0x00000002
+let SQLITE_OPEN_CREATE = 0x00000004
+
+fn extern sqlite3_open_v2(
+  path: Pointer[Uint8],
+  db: Pointer[Uint8],
+  flags: Int32,
+  vfs: Pointer[Uint8],
+) -> Int32
+
+fn extern sqlite3_prepare_v2(
+  db: Pointer[Uint8],
+  sql: Pointer[Uint8],
+  size: Int32,
+  out: Pointer[Uint8],
+  tail: Pointer[Uint8],
+) -> Int32
+
+fn extern sqlite3_errstr(code: Int32) -> Pointer[Uint8]
+
+fn extern sqlite3_step(statement: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_finalize(statement: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_close(db: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_reset(statement: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_changes(db: Pointer[Uint8]) -> Int32
+
+fn extern sqlite3_bind_null(statement: Pointer[Uint8], column: Int32) -> Int32
+
+fn extern sqlite3_bind_int64(
+  statement: Pointer[Uint8],
+  column: Int32,
+  value: Int,
+) -> Int32
+
+fn extern sqlite3_bind_double(
+  statement: Pointer[Uint8],
+  column: Int32,
+  value: Float64,
+) -> Int32
+
+fn extern sqlite3_bind_text64(
+  statement: Pointer[Uint8],
+  column: Int32,
+  value: Pointer[Uint8],
+  size: Int,
+  destructor: Pointer[Uint8],
+  encoding: Int8,
+) -> Int32
+
+fn extern sqlite3_bind_zeroblob(
+  statement: Pointer[Uint8],
+  column: Int32,
+  size: Int32,
+) -> Int32
+
+fn extern sqlite3_bind_blob64(
+  statement: Pointer[Uint8],
+  column: Int32,
+  value: Pointer[Uint8],
+  size: Int,
+  destructor: Pointer[Uint8],
+) -> Int32
+
+# An error produced when opening a database connection.
+type pub copy enum OpenError {
+  case Other(Int)
+}
+
+impl Equal for OpenError {
+  fn pub ==(other: Self) -> Bool {
+    match (self, other) {
+      case (Other(a), Other(b)) -> a == b
+      case (a, b) -> enum_tag(a) == enum_tag(b)
+    }
+  }
+}
+
+impl ToString for OpenError {
+  fn pub to_string -> String {
+    match self {
+      case Other(v) -> String.from_pointer(sqlite3_errstr(v as Int32))
+    }
+  }
+}
+
+impl Format for OpenError {
+  fn pub fmt(formatter: mut Formatter) {
+    match self {
+      case Other(v) -> formatter.tuple('Other').field(v).finish
+    }
+  }
+}
+
+type pub Database {
+  let @handle: Pointer[Uint8]
+
+  fn static open[T: ToString](
+    path: ref T,
+    flags: Int,
+  ) -> Result[Database, OpenError] {
+    let handle = null
+    let code = sqlite3_open_v2(
+      path.to_string.pointer,
+      mut handle,
+      flags as Int32,
+      null,
+    )
+      as Int
+
+    if code == SQLITE_OK {
+      Result.Ok(Database(handle))
+    } else {
+      # TODO: sqlite docs don't mention which exact error codes may be returned
+      # when opening a database, but we should avoid returning a big error enum
+      # containing irrelevant constructors.
+
+      if handle as Int != (null as Int) { sqlite3_close(handle) }
+
+      Result.Error(OpenError.Other(code))
+    }
+  }
+
+  fn pub static new[T: ToString](path: ref T) -> Result[Database, OpenError] {
+    open(path, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+  }
+
+  fn pub static read_only[T: ToString](
+    path: ref T,
+  ) -> Result[Database, OpenError] {
+    open(path, flags: SQLITE_OPEN_READONLY)
+  }
+}
+
+type pub inline Statement {
+  fn pub mut bind(column: Int, value: String) -> Result[Nil, String] {
+    Result.Error('TODO')
+  }
+}

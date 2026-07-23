@@ -1,0 +1,26 @@
+---
+name: Tests
+on:
+  workflow_call:
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/inko-lang/inko:main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: inko --version
+      - run: inko fmt --check
+
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/inko-lang/inko:main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install dependencies
+        run: microdnf install --quiet --assumeyes sqlite-libs
+      - run: microdnf list --installed sqlite
+      - run: inko --version
+      - run: inko test
