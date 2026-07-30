@@ -43,7 +43,7 @@ for row in st.rows {
 ## Installation
 
 ```bash
-inko pkg add github.com/yorickpeterse/inko-sqlite 0.1.0
+inko pkg add github.com/yorickpeterse/inko-sqlite 0.2.0
 inko pkg sync
 ```
 
