@@ -9,7 +9,7 @@ import std.bytes (Bytes, ToByteArray)
 import std.env (temporary_directory)
 import std.fmt (fmt)
 import std.int (MAX as INT_MAX)
-import std.io (Error as IoError, SeekFrom)
+import std.io (Error as IoError, ReadExactError, SeekFrom)
 import std.ptr (null)
 import std.string (ToString)
 import std.test (Tests)
@@ -247,20 +247,45 @@ fn pub tests(t: mut Tests) {
     let buf = ByteArray.new
 
     t.equal(blob.read(into: buf, size: 5), Result.Ok(5))
+    t.equal(blob.offset, 5)
+    t.equal(buf.to_string, 'hello')
+
+    t.equal(blob.read(into: buf, size: 5), Result.Ok(0))
+    t.equal(blob.offset, 5)
     t.equal(buf.drain_to_string, 'hello')
 
-    t.equal(blob.read(into: buf, size: 5), Result.Ok(5))
-    t.equal(buf.drain_to_string, 'hello')
-
+    t.equal(blob.seek(SeekFrom.Start(0)), Result.Ok(0))
     t.equal(blob.read(into: buf, size: 3), Result.Ok(3))
+    t.equal(blob.offset, 3)
     t.equal(buf.drain_to_string, 'hel')
 
+    t.equal(blob.seek(SeekFrom.Start(0)), Result.Ok(0))
     t.equal(blob.read(into: buf, size: 100), Result.Ok(5))
+    t.equal(blob.offset, 5)
     t.equal(buf.drain_to_string, 'hello')
 
     t.equal(blob.seek(SeekFrom.Start(2)), Result.Ok(2))
     t.equal(blob.read(into: buf, size: 10), Result.Ok(3))
+    t.equal(blob.offset, 5)
     t.equal(buf.drain_to_string, 'llo')
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Blob.read with an expired blob', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.execute('CREATE TABLE blobs (value BLOB)')
+    try db.execute('INSERT INTO blobs VALUES ("hello")')
+
+    let id = db.last_inserted_row_id
+    let blob = try db.blob(MAIN_DB, 'blobs', 'value', id, write: false)
+    let buf = ByteArray.new
+
+    try db.execute('UPDATE blobs SET value = "foo"')
+
+    t.equal(blob.read(into: buf, size: 3), Result.Error(Error.Aborted))
+    t.equal(buf, ByteArray.new)
 
     Result.Ok(nil)
   })
@@ -276,9 +301,31 @@ fn pub tests(t: mut Tests) {
     let buf = ByteArray.new
 
     t.equal(blob.read_all(buf), Result.Ok(5))
-    t.equal(buf.drain_to_string, 'hello')
-    t.equal(blob.read_all(buf), Result.Ok(5))
-    t.equal(buf.drain_to_string, 'hello')
+    t.equal(buf.to_string, 'hello')
+    t.equal(blob.read_all(buf), Result.Ok(0))
+    t.equal(buf.to_string, 'hello')
+
+    Result.Ok(nil)
+  })
+
+  t.ok('Blob.read_exact', fn (t) {
+    let db = try Database.new(':memory:')
+
+    try db.execute('CREATE TABLE blobs (value BLOB)')
+    try db.execute('INSERT INTO blobs VALUES ("hello")')
+
+    let id = db.last_inserted_row_id
+    let blob = try db.blob(MAIN_DB, 'blobs', 'value', id, write: false)
+    let buf = ByteArray.new
+
+    t.equal(blob.read_exact(into: buf, size: 5), Result.Ok(nil))
+    t.equal(buf, 'hello'.to_byte_array)
+
+    t.equal(blob.seek(SeekFrom.Start(0)), Result.Ok(0))
+    t.equal(
+      blob.read_exact(into: buf, size: 10),
+      Result.Error(ReadExactError.EndOfInput),
+    )
 
     Result.Ok(nil)
   })
