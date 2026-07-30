@@ -6,7 +6,7 @@ what's useful for say 90% of all use cases. For example, defining custom
 functions isn't supported but support for that may be added in the future if
 deemed necessary.
 
-# Example
+## Example
 
 ```inko
 import sqlite (Database)
@@ -34,20 +34,20 @@ for row in st.rows {
 }
 ```
 
-# Requirements
+## Requirements
 
 - Inko `main`
 - An installation of SQLite that provides a shared or static library, such as
   the `sqlite-devel` package when using Fedora
 
-# Installation
+## Installation
 
 ```bash
 inko pkg add github.com/yorickpeterse/inko-sqlite 0.1.0
 inko pkg sync
 ```
 
-# License
+## License
 
 All source code in this repository is licensed under the Mozilla Public License
 version 2.0, unless stated otherwise. A copy of this license is found in the
