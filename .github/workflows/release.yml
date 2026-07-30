@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/inko-lang/idoc-main:latest
+      image: ghcr.io/inko-lang/idoc-main:main
     needs:
       - tests
     steps:
